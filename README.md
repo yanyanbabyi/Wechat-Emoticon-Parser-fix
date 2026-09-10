@@ -38,6 +38,7 @@
 - **wxgf 动图支持**：HEVC 流提取 + 首帧/整段转码（GIF/PNG/JPEG 直出）
 - **聊天图片解密**：V2 格式 `.dat` 全量还原（`--images`）
 - **结构化 manifest**：`{packs, favorites, unknown, summary}` 与目录树一一对应，已排序
+- **中英双语界面**：默认中文；在菜单里键入 `e` 切换英文，键入 `c` 切回中文
 - **轻依赖**：仅需 `pycryptodome`（转码可选 `imageio-ffmpeg`）
 
 ---
@@ -145,6 +146,7 @@ Windows 用户可直接双击 `启动.bat`（会自动检测并安装缺失依�
 #   [4] 解密全部数据库（db_storage → decrypted_db/）
 #   [5] 提取并显示密钥（seed / emoticon key / V2 key）
 #   [0] 退出
+#   界面默认中文；在菜单里键入 e 切换英文，键入 c 切回中文
 python wechat_emoticon_export.py
 
 # 参数模式（离线 / 自定义路径）

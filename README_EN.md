@@ -51,6 +51,7 @@ Also added:
 - **wxgf animation support**: HEVC stream extraction + transcoding (GIF/PNG/JPEG output)
 - **Chat image decryption**: V2-format `.dat` full restoration (`--images`)
 - **Structured manifest**: `{packs, favorites, unknown, summary}` mirrored to the directory tree, sorted
+- **Bilingual interface**: Chinese by default; type `e` at the menu to switch to English, `c` to switch back
 - **Lightweight**: only requires `pycryptodome` (optional `imageio-ffmpeg` for transcoding)
 
 ---
@@ -161,6 +162,7 @@ On Windows you can simply double-click `启动.bat`, which detects and installs 
 #   [4] decrypt ALL databases (db_storage -> decrypted_db/)
 #   [5] extract & show keys (seed / emoticon key / V2 key)
 #   [0] exit
+#   the interface defaults to Chinese; type e at the menu to switch to English, c to switch back
 python wechat_emoticon_export.py
 
 # Argument mode (offline / custom paths)

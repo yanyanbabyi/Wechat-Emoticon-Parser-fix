@@ -34,8 +34,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ctypes import wintypes as wt
 
-# ============ 界面语言 (按 c 切换中/英) ============
-LANG = {"cur": "en"}
+# ============ 界面语言 (默认中文; 菜单里键入 e 切英文 / c 切回中文) ============
+LANG = {"cur": "zh"}
 
 
 def T(zh, en):
@@ -165,7 +165,8 @@ def find_key_from_memory(c0, wxid):
     if not wxs:
         return None
     seeds = scan_seeds_from_memory()
-    print(f"[*] Verifying {len(seeds)} seeds x {len(wxs)} wxid candidate(s): {', '.join(wxs)}")
+    print(T(f"[*] 校验 {len(seeds)} 个 seed x {len(wxs)} 个 wxid 候选: {', '.join(wxs)}",
+            f"[*] Verifying {len(seeds)} seeds x {len(wxs)} wxid candidate(s): {', '.join(wxs)}"))
     from concurrent.futures import ThreadPoolExecutor, as_completed
     n = min(16, (os.cpu_count() or 8))
     with ThreadPoolExecutor(max_workers=n) as pool:
@@ -389,9 +390,10 @@ def find_data_dir():
         if not accs:
             continue
         if len(accs) > 1:
-            print(f"[*] {len(accs)} account dirs found, using: {os.path.basename(accs[0])}")
+            print(T(f"[*] 发现 {len(accs)} 个账号目录, 使用: {os.path.basename(accs[0])}",
+                    f"[*] {len(accs)} account dirs found, using: {os.path.basename(accs[0])}"))
             for a in accs[1:]:
-                print(f"    skipped: {a}")
+                print(T(f"    已跳过: {a}", f"    skipped: {a}"))
         return accs[0]
     return None
 
@@ -1283,7 +1285,8 @@ def v2_export(data_dir, out_dir, seed, wxid):
     wxs = [w for w in wxs if w] or [auto_wxid(data_dir)]
     if len(wxs) > 1:
         wxid, hits = v2_pick_wxid(dat_files, seed, wxs, xor_key)
-        print(f"[*] wxid chosen by probe: {wxid} ({hits} sample .dat decoded)")
+        print(T(f"[*] 用 {hits} 个样本 .dat 实测选定 wxid: {wxid}",
+                f"[*] wxid chosen by probe: {wxid} ({hits} sample .dat decoded)"))
     else:
         wxid = wxs[0]
     v2key = hashlib.md5(f"{seed}{wxid}".encode()).hexdigest()[:16].encode()
@@ -1352,7 +1355,8 @@ def run_images(data_dir, wxid, emo_dir, out_dir, seed=None):
         v2_export(data_dir, out_dir, seed, wxs)
     else:
         if not emo_dir or not os.path.isdir(emo_dir):
-            print("[!] Need emoticon dir for C0 verification, or use --seed")
+            print(T("[!] 需要表情目录来取 C0 校验样本, 或使用 --seed",
+                    "[!] Need emoticon dir for C0 verification, or use --seed"))
             return None
         c0 = None
         for root, dirs, names in os.walk(emo_dir):
@@ -1365,10 +1369,12 @@ def run_images(data_dir, wxid, emo_dir, out_dir, seed=None):
                 break
         found = find_key_from_memory(c0, wxs) if c0 else None
         if not found:
-            print("[!] Memory scan found no seed; run WeChat first or use --seed")
+            print(T("[!] 内存扫描没有找到 seed; 请先运行微信, 或使用 --seed",
+                    "[!] Memory scan found no seed; run WeChat first or use --seed"))
             return None
         seed, _key, wxid = found
-        print(f"[+] HIT seed={seed} | wxid={wxid} (C0 verified)")
+        print(T(f"[+] 命中 seed={seed} | wxid={wxid} (已通过 C0 校验)",
+                f"[+] HIT seed={seed} | wxid={wxid} (C0 verified)"))
         v2_export(data_dir, out_dir, seed, wxid)
     print(f"[OK] Done in {time.time()-t0:.0f}s, output: {out_dir}")
 
@@ -1402,20 +1408,26 @@ def run_export(data_dir, wxid, emo_dir, out_dir="emoticon_export", key_hex=None,
         # 显式给了 seed: 用候选 wxid 逐个派生, 由 C0 校验决定哪个对
         key, wxid = key_from_seed(seed, wxs, c0)
         if key:
-            print(f"[+] seed={seed} verified against emoticon files (wxid={wxid})")
+            print(T(f"[+] seed={seed} 已通过表情文件校验 (wxid={wxid})",
+                    f"[+] seed={seed} verified against emoticon files (wxid={wxid})"))
         else:
             wxid = wxs[0]
             key = derive_key(seed, wxid)
-            print(f"[!] seed={seed} 派生出的 key 与表情文件不符 (wxid 候选均不匹配: {', '.join(wxs)})")
+            print(T(f"[!] seed={seed} 派生出的 key 与表情文件不符 (wxid 候选均不匹配: {', '.join(wxs)})",
+                    f"[!] key derived from seed={seed} does not match the emoticon files "
+                    f"(none of the wxid candidates worked: {', '.join(wxs)})"))
         print(f"[+] emoticon key = {key.hex()}")
     else:
         found = find_key_from_memory(c0, wxs)
         if not found:
-            print("[!] Memory scan found no emoticon key")
-            print("    Note: WeChat must be running; or use --key <hex> / --seed <seed> offline")
+            print(T("[!] 内存扫描没有找到可用的表情密钥",
+                    "[!] Memory scan found no emoticon key"))
+            print(T("    注意: 微信必须处于运行状态; 离线时可用 --key <hex> / --seed <seed>",
+                    "    Note: WeChat must be running; or use --key <hex> / --seed <seed> offline"))
             return None
         seed, key, wxid = found
-        print(f"\n[+] HIT! seed={seed} | wxid={wxid}")
+        print(T(f"\n[+] 命中! seed={seed} | wxid={wxid}",
+                f"\n[+] HIT! seed={seed} | wxid={wxid}"))
         print(f"[+] emoticon key = {key.hex()}")
         print(f"[+] md5 input = {seed}{wxid}EMOTICON")
 
@@ -1617,11 +1629,13 @@ def tool_show_keys(data_dir, wxid, emo_dir):
             if c0:
                 break
     if not c0:
-        print("[!] No emoticon file to verify against (WeChat must be running)")
+        print(T("[!] 没有表情文件可供校验 (微信需要处于运行状态)",
+                "[!] No emoticon file to verify against (WeChat must be running)"))
         return None
     found = find_key_from_memory(c0, wxid_candidates(data_dir, wxid))
     if not found:
-        print("[!] Memory scan found no seed (WeChat must be running)")
+        print(T("[!] 内存扫描没有找到 seed (微信需要处于运行状态)",
+                "[!] Memory scan found no seed (WeChat must be running)"))
         return None
     seed, key, wxid = found
     v2key = hashlib.md5(f"{seed}{wxid}".encode()).hexdigest()[:16]
@@ -1645,7 +1659,12 @@ def interactive():
     print("=" * 56)
     while True:
         print()
-        print(T("请选择操作 (按 c 切换语言):", "Select an operation (press c for 中文):"))
+        print(T("请选择操作:", "Select an operation:"))
+        # 提示用"目标语言"写: 中文界面下用英文告诉你怎么切到英文, 反之亦然
+        if LANG["cur"] == "zh":
+            print('  Type "e" to switch to English')
+        else:
+            print("  键入 c 切换为中文")
         print(T("  [1] 表情包导出 (解密+分割+命名+CDN收藏)", "  [1] Export emoticons (decrypt+split+name+CDN favorites)"))
         print(T("  [2] V2 聊天图片解密 (msg/ 目录)", "  [2] Decrypt V2 chat images (msg/)"))
         print(T("  [3] 表情包导出 - 平铺模式 (emoticon_export_all/)", "  [3] Export emoticons - flatten mode (emoticon_export_all/)"))
@@ -1658,11 +1677,12 @@ def interactive():
             print()
             print(T("再见", "Bye"))
             break
-        if choice.lower() == "c":
-            LANG["cur"] = "zh" if LANG["cur"] == "en" else "en"
-            if LANG["cur"] == "zh":
+        if choice.lower() in ("c", "e"):
+            if choice.lower() == "c":
+                LANG["cur"] = "zh"
                 print("[i] 已切换为中文")
             else:
+                LANG["cur"] = "en"
                 print("[i] Switched to English")
             continue
         if choice in ("", "0", "q", "Q", "quit"):
