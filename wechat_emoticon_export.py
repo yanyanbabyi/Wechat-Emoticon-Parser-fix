@@ -50,10 +50,13 @@ MAX_REGION = 200 * 1024 * 1024
 CHUNK = 32 * 1024 * 1024  # 大块读取减少 syscall 往返
 RE_SEED = re.compile(rb'(?<![0-9])(\d{8,12})(?![0-9])')
 DEFAULT_BASES = [
-    r"E:\Program\Tencent Files\xwechat_files",
-    r"D:\Program Files\Tencent\xwechat_files",
-    r"C:\Program Files\Tencent\xwechat_files",
+    r"%USERPROFILE%\xwechat_files",
     r"%USERPROFILE%\Documents\xwechat_files",
+    r"%USERPROFILE%\Documents\Tencent Files\xwechat_files",
+    r"C:\Program Files\Tencent\xwechat_files",
+    r"D:\Program Files\Tencent\xwechat_files",
+    r"E:\Program Files\Tencent\xwechat_files",
+    r"E:\Program\Tencent Files\xwechat_files",
 ]
 
 # ==================== Windows 内存读取 ====================
@@ -123,7 +126,8 @@ def scan_seeds_from_memory(pid=None):
                     data = tail + chunk
                     for m in RE_SEED.finditer(data):
                         v = int(m.group(0))
-                        if 100_000_000 < v < 4_000_000_000:
+                        # seed 是 32 位无符号整数, 上界必须是 2**32 (4e9 会漏掉 4.0e9~4.29e9 的账号)
+                        if 0 < v < 2 ** 32:
                             seeds.add(v)
                     tail = data[-64:]
                 else:
@@ -150,18 +154,46 @@ def verify_key(key, c0):
 
 
 def find_key_from_memory(c0, wxid):
-    """内存扫描 seed -> 派生 -> C0 验证, 返回 (seed, key) 或 None (并行验证)"""
+    """内存扫描 seed -> 派生 -> C0 校验
+
+    wxid 可以是字符串或候选列表: 逐个候选 × 逐个 seed 校验, 命中者即为真 wxid。
+    返回 (seed, key, wxid) 或 None —— 注意 wxid 是校验出来的那个, 调用方要用它
+    往下走 (V2 图片 key 也依赖同一个 wxid)。
+    """
+    wxs = wxid if isinstance(wxid, (list, tuple, set)) else [wxid]
+    wxs = [w for w in wxs if w]
+    if not wxs:
+        return None
     seeds = scan_seeds_from_memory()
-    print(f"[*] Verifying {len(seeds)} candidates (wxid={wxid})...")
+    print(f"[*] Verifying {len(seeds)} seeds x {len(wxs)} wxid candidate(s): {', '.join(wxs)}")
     from concurrent.futures import ThreadPoolExecutor, as_completed
     n = min(16, (os.cpu_count() or 8))
     with ThreadPoolExecutor(max_workers=n) as pool:
-        futs = {pool.submit(_verify_one, s, wxid, c0): s for s in sorted(seeds)}
+        futs = {pool.submit(_verify_one, s, w, c0): (s, w) for w in wxs for s in sorted(seeds)}
         for fut in as_completed(futs):
-            r = fut.result()
-            if r:
-                return r
+            if fut.result():
+                s, w = futs[fut]
+                return s, derive_key(s, w), w
     return None
+
+
+def key_from_seed(seed, wxids, c0=None):
+    """已知 seed + 候选 wxid -> (key, wxid)
+
+    有 c0 (表情文件首块) 时以能通过 C0 校验的候选为准; 全都不通过则退回第一个候选
+    并返回 None 作为 key, 由调用方决定是否继续。
+    """
+    wxs = wxids if isinstance(wxids, (list, tuple, set)) else [wxids]
+    wxs = [w for w in wxs if w]
+    if not wxs:
+        return None, ""
+    if c0 is not None:
+        for w in wxs:
+            k = derive_key(seed, w)
+            if verify_key(k, c0):
+                return k, w
+        return None, wxs[0]
+    return derive_key(seed, wxs[0]), wxs[0]
 
 
 def _verify_one(seed, wxid, c0):
@@ -172,20 +204,230 @@ def _verify_one(seed, wxid, c0):
 
 
 # ==================== data dir定位 ====================
-def find_data_dir():
-    for base in DEFAULT_BASES:
-        b = os.path.expandvars(base)
-        if not os.path.isdir(b):
+# 微信 4.x 数据根目录名 (3.x 为 WeChat Files), 账号目录是根目录下的 wxid_*
+WX_DATA_ROOTNAMES = ("xwechat_files", "WeChat Files")
+
+
+def _norm_dir(p):
+    """展开环境变量/引号, 归一化路径; 非法则 None"""
+    try:
+        p = str(p).strip().strip('"').strip()
+        if not p:
+            return None
+        return os.path.normpath(os.path.expandvars(os.path.expanduser(p)))
+    except Exception:
+        return None
+
+
+def _looks_like_abs_path(s):
+    return bool(re.match(r"^[A-Za-z]:[\\/]", s)) or s.startswith("\\\\")
+
+
+def _cfg_roots():
+    """微信自己记录的数据根 (config/*.ini 里存的是数据根, 数据在其下 xwechat_files)
+
+    例: %APPDATA%\\Tencent\\xwechat\\config\\<hash>.ini 内容 = C:\\Users\\xxx
+    """
+    out = []
+    appdata = os.environ.get("APPDATA") or ""
+    for sub in (r"Tencent\xwechat\config", r"Tencent\xwechat\All Users\config",
+                r"Tencent\WeChat\All Users\config", r"Tencent\WeChat\config"):
+        d = os.path.join(appdata, sub)
+        if not os.path.isdir(d):
             continue
-        for d in sorted(os.listdir(b)):
-            if d.startswith("wxid_"):
-                return os.path.join(b, d)
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            if not n.lower().endswith((".ini", ".cfg")):
+                continue
+            p = os.path.join(d, n)
+            try:
+                if not (0 < os.path.getsize(p) <= 4096):
+                    continue
+                raw = open(p, "rb").read().decode("utf-8", "ignore").strip().lstrip("\ufeff")
+            except OSError:
+                continue
+            if "\n" not in raw and _looks_like_abs_path(raw):
+                out.append(raw)
+    return out
+
+
+def _proc_roots():
+    """从运行中的 Weixin.exe 已打开文件反推数据根 (微信在跑就一定准)
+
+    依赖可选的 psutil; 没装则跳过 (不影响其它来源)。
+    """
+    out = []
+    try:
+        import psutil
+    except ImportError:
+        return out
+    for pr in psutil.process_iter(["name"]):
+        if (pr.info.get("name") or "").lower() not in ("weixin.exe", "wechat.exe"):
+            continue
+        try:
+            files = pr.open_files()
+        except Exception:
+            continue
+        for f in files:
+            low = f.path.lower()
+            for rn in WX_DATA_ROOTNAMES:
+                i = low.find(rn.lower())
+                if i > 0:
+                    out.append(f.path[: i + len(rn)])
+                    break
+    return out
+
+
+def _reg_roots():
+    """注册表里任何形如绝对路径的值 (FileSavePath / InstallPath 等, 版本间名字不固定)"""
+    out = []
+    try:
+        import winreg
+    except ImportError:
+        return out
+    for hive, key in ((winreg.HKEY_CURRENT_USER, r"Software\Tencent\Weixin"),
+                      (winreg.HKEY_CURRENT_USER, r"Software\Tencent\WeChat"),
+                      (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Tencent\Weixin")):
+        try:
+            with winreg.OpenKey(hive, key) as k:
+                cnt = winreg.QueryInfoKey(k)[1]
+                for i in range(cnt):
+                    try:
+                        _n, v, _t = winreg.EnumValue(k, i)
+                    except OSError:
+                        continue
+                    if isinstance(v, str) and _looks_like_abs_path(v.strip()):
+                        out.append(v.strip())
+        except (FileNotFoundError, OSError):
+            continue
+    return out
+
+
+def _data_root_candidates():
+    """按可信度产出数据根目录候选 (去重保序)
+
+    1) 微信自身配置 ini   2) 运行中进程实际打开的文件
+    3) 注册表路径值       4) 常见静态位置
+    """
+    out = []
+
+    def add(p):
+        p = _norm_dir(p)
+        if p and p not in out:
+            out.append(p)
+
+    for raw in _cfg_roots():
+        add(os.path.join(raw, "xwechat_files"))
+        add(raw)
+    for raw in _proc_roots():
+        add(raw)
+    for raw in _reg_roots():
+        add(os.path.join(raw, "xwechat_files"))
+        add(raw)
+    for raw in DEFAULT_BASES:
+        add(raw)
+    for extra in ("%USERPROFILE%", os.path.join("%USERPROFILE%", "Documents"), "%PUBLIC%"):
+        for rn in WX_DATA_ROOTNAMES:
+            add(os.path.join(extra, rn))
+    return out
+
+
+def _account_score(p):
+    """账号目录的"真实性"得分: 空目录/备份副本得 0 分被淘汰"""
+    s = 0
+    if os.path.isdir(os.path.join(p, "business", "emoticon")):
+        s += 4
+    if os.path.isdir(os.path.join(p, "db_storage")):
+        s += 2
+    if os.path.isdir(os.path.join(p, "msg")):
+        s += 1
+    return s
+
+
+def _accounts_in(root):
+    """root (数据根 或 其父目录) 下的真实账号目录, 按得分降序"""
+    if not os.path.isdir(root):
+        return []
+    roots = [root]
+    if os.path.basename(os.path.normpath(root)).lower() not in ("xwechat_files", "wechat files"):
+        sub = os.path.join(root, "xwechat_files")
+        if os.path.isdir(sub):
+            roots.insert(0, sub)
+    scored, seen = [], set()
+    for r in roots:
+        try:
+            entries = sorted(os.listdir(r))
+        except OSError:
+            continue
+        for name in entries:
+            p = os.path.join(r, name)
+            if not name.startswith("wxid_") or not os.path.isdir(p):
+                continue
+            rp = os.path.realpath(p)
+            if rp in seen:
+                continue
+            seen.add(rp)
+            s = _account_score(p)
+            if s:
+                scored.append((s, p))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [p for _s, p in scored]
+
+
+def find_data_dir():
+    """多来源定位微信账号数据目录 (wxid_*)
+
+    优先级: 微信自身配置 > 运行中进程打开的文件 > 注册表 > 常见静态路径;
+    每个来源下再按内容特征 (business/emoticon、db_storage、msg) 挑真实账号目录,
+    Backup/old_backup 这类同名副本会被淘汰。找不到返回 None。
+    """
+    for root in _data_root_candidates():
+        accs = _accounts_in(root)
+        if not accs:
+            continue
+        if len(accs) > 1:
+            print(f"[*] {len(accs)} account dirs found, using: {os.path.basename(accs[0])}")
+            for a in accs[1:]:
+                print(f"    skipped: {a}")
+        return accs[0]
     return None
 
 
 def auto_wxid(data_dir):
-    name = os.path.basename(data_dir)
-    return name[:-5] if name.endswith("_b487") else name
+    """数据目录名 -> wxid (最佳猜测, 仅供显示)
+
+    微信 4.x 目录名形如 <wxid>_<4 位十六进制>(例 wxid_xxx_b487 / wxid_xxx_2524),
+    后缀由安装路径决定, 不固定 —— 不能只判 _b487。
+    真正用哪个由 C0 校验决定, 见 wxid_candidates()。
+    """
+    return (wxid_candidates(data_dir) or [os.path.basename(os.path.normpath(data_dir))])[0]
+
+
+def wxid_candidates(data_dir, extra=None):
+    """目录名 -> 候选 wxid 列表 (按可信度排序)
+
+    后缀不可预测, 所以这里不"猜对", 而是给出多个候选, 由 C0 校验 (表情文件)
+    或 V2 抽样实测来定谁是真的。任一候选命中即为真 wxid。
+    """
+    name = os.path.basename(os.path.normpath(data_dir))
+    out = []
+
+    def add(v):
+        if v and v not in out:
+            out.append(v)
+
+    if extra:
+        add(extra)
+    m = re.fullmatch(r"(wxid_[A-Za-z0-9]+)_[0-9a-fA-F]{4}", name)
+    if m:
+        add(m.group(1))          # 形态 1: <wxid>_<4hex>
+    if "_" in name[5:]:
+        add(name.rsplit("_", 1)[0])   # 形态 2: 去掉最后一个下划线后缀 (任意形态)
+    add(name)                    # 形态 3: 目录名本身就是 wxid
+    return out
 
 
 def find_emoticon_dir(data_dir):
@@ -908,24 +1150,41 @@ V1_KEY = b"cfcd208495d565ef"
 
 
 def v2_find_xor(dat_files):
-    """从 JPEG 尾部 FF D9 反推单字节 XOR key"""
+    """从 V2 尾部反推单字节 XOR key
+
+    明文 JPEG 的末两字节是 FF D9, 所以 key = tail[0]^0xFF, 且必须满足
+    tail[1]^0xD9 == key (自洽校验, 用来排除 PNG/HEVC 等非 JPEG 尾部)。
+    必须扫描足够多的 V2 文件: 只看前 40 个时, 若这批恰好全是未加密条目
+    (本机 msg/attach 下 22941 个 .dat 里, 排序前 40 个和 os.walk 前 40 个
+    都不含 V2), 就会静默退回写死的 0x88 —— 那是错的, 会把图片全解坏。
+    """
     from collections import Counter
     tail_counts = Counter()
-    for f in dat_files[:40]:
+    scanned = 0
+    for f in dat_files:
+        if scanned >= 2000:
+            break
         try:
             sz = os.path.getsize(f)
+            if sz < 15:
+                continue
             with open(f, "rb") as fp:
                 head = fp.read(6)
                 fp.seek(sz - 2)
                 tail = fp.read(2)
-            if head == V2_MAGIC and len(tail) == 2:
-                tail_counts[(tail[0], tail[1])] += 1
         except OSError:
             continue
+        if head != V2_MAGIC or len(tail) != 2:
+            continue
+        scanned += 1
+        x, y = tail
+        k = x ^ 0xFF
+        if (y ^ 0xD9) == k:
+            tail_counts[k] += 1
     if not tail_counts:
         return 0x88
-    (x, y), _ = tail_counts.most_common(1)[0]
-    return x ^ 0xFF  # 校验 y^0xD9 == xor 一致则成立
+    k, _ = tail_counts.most_common(1)[0]
+    return k
 
 
 def v2_decrypt(path, key, xor_key):
@@ -969,11 +1228,43 @@ def v2_ext(header):
     return "bin"
 
 
-def v2_export(data_dir, out_dir, seed, wxid):
-    """V2 聊天图片解密: key = md5(f"{seed}{wxid}")[:16] (16字符 ASCII)"""
-    v2key = hashlib.md5(f"{seed}{wxid}".encode()).hexdigest()[:16].encode()
-    print(f"[*] V2 key = md5({seed}{wxid})[:16] = {v2key.decode()}")
+def v2_pick_wxid(dat_files, seed, wxids, xor_key, probe=12):
+    """实测挑选 wxid 候选: 谁派生的 V2 key 能真正解出图片, 谁就是真的
 
+    表情文件不在 / 无法用 C0 校验时 (例如只解图片), 这就是 V2 侧的等效校验。
+    """
+    v2s = []
+    for p in dat_files:
+        try:
+            with open(p, "rb") as fp:
+                if fp.read(6) == V2_MAGIC:
+                    v2s.append(p)
+        except OSError:
+            continue
+        if len(v2s) >= probe:
+            break
+    if not v2s:
+        return wxids[0], 0
+    best, best_ok = wxids[0], 0
+    for w in wxids:
+        k = hashlib.md5(f"{seed}{w}".encode()).hexdigest()[:16].encode()
+        ok = 0
+        for p in v2s:
+            r = v2_decrypt(p, k, xor_key)
+            if r and v2_ext(r) != "bin":
+                ok += 1
+        if ok > best_ok:
+            best, best_ok = w, ok
+        if ok == len(v2s):
+            break
+    return best, best_ok
+
+
+def v2_export(data_dir, out_dir, seed, wxid):
+    """V2 聊天图片解密: key = md5(f"{seed}{wxid}")[:16] (16字符 ASCII)
+
+    wxid 也可以是候选列表: 会先用少量 .dat 实测, 选出真能解出图片的那个候选。
+    """
     msg_dir = os.path.join(data_dir, "msg")
     if not os.path.isdir(msg_dir):
         print(f"[!] no msg dir: {msg_dir}")
@@ -987,6 +1278,16 @@ def v2_export(data_dir, out_dir, seed, wxid):
 
     xor_key = v2_find_xor(dat_files)
     print(f"[*] XOR key: 0x{xor_key:02x}")
+
+    wxs = wxid if isinstance(wxid, (list, tuple, set)) else [wxid]
+    wxs = [w for w in wxs if w] or [auto_wxid(data_dir)]
+    if len(wxs) > 1:
+        wxid, hits = v2_pick_wxid(dat_files, seed, wxs, xor_key)
+        print(f"[*] wxid chosen by probe: {wxid} ({hits} sample .dat decoded)")
+    else:
+        wxid = wxs[0]
+    v2key = hashlib.md5(f"{seed}{wxid}".encode()).hexdigest()[:16].encode()
+    print(f"[*] V2 key = md5({seed}{wxid})[:16] = {v2key.decode()}")
 
     out_img = out_dir if out_dir.endswith("decoded_images") else os.path.join(out_dir, "decoded_images")
     os.makedirs(out_img, exist_ok=True)
@@ -1045,7 +1346,11 @@ def v2_export(data_dir, out_dir, seed, wxid):
 def run_images(data_dir, wxid, emo_dir, out_dir, seed=None):
     """V2 聊天图片解密"""
     t0 = time.time()
-    if not seed:
+    wxs = wxid_candidates(data_dir, wxid)
+    if seed:
+        # 有 seed 但没做 C0 校验: 把候选交给 v2_export 用 .dat 实测定 wxid
+        v2_export(data_dir, out_dir, seed, wxs)
+    else:
         if not emo_dir or not os.path.isdir(emo_dir):
             print("[!] Need emoticon dir for C0 verification, or use --seed")
             return None
@@ -1058,13 +1363,13 @@ def run_images(data_dir, wxid, emo_dir, out_dir, seed=None):
                     break
             if c0:
                 break
-        found = find_key_from_memory(c0, wxid) if c0 else None
+        found = find_key_from_memory(c0, wxs) if c0 else None
         if not found:
             print("[!] Memory scan found no seed; run WeChat first or use --seed")
             return None
-        seed, _ = found
-        print(f"[+] HIT seed={seed}")
-    v2_export(data_dir, out_dir, seed, wxid)
+        seed, _key, wxid = found
+        print(f"[+] HIT seed={seed} | wxid={wxid} (C0 verified)")
+        v2_export(data_dir, out_dir, seed, wxid)
     print(f"[OK] Done in {time.time()-t0:.0f}s, output: {out_dir}")
 
 
@@ -1089,17 +1394,28 @@ def run_export(data_dir, wxid, emo_dir, out_dir="emoticon_export", key_hex=None,
         print("[!] no emoticon files")
         return None
     # 密钥
+    wxs = wxid_candidates(data_dir, wxid)
     if key_hex:
         key = bytes.fromhex(key_hex)
         print(f"[*] Using provided key: {key.hex()}")
+    elif seed:
+        # 显式给了 seed: 用候选 wxid 逐个派生, 由 C0 校验决定哪个对
+        key, wxid = key_from_seed(seed, wxs, c0)
+        if key:
+            print(f"[+] seed={seed} verified against emoticon files (wxid={wxid})")
+        else:
+            wxid = wxs[0]
+            key = derive_key(seed, wxid)
+            print(f"[!] seed={seed} 派生出的 key 与表情文件不符 (wxid 候选均不匹配: {', '.join(wxs)})")
+        print(f"[+] emoticon key = {key.hex()}")
     else:
-        found = find_key_from_memory(c0, wxid) if not seed else None
+        found = find_key_from_memory(c0, wxs)
         if not found:
             print("[!] Memory scan found no emoticon key")
-            print("    Note: WeChat must be running; or use --key <hex> offline")
+            print("    Note: WeChat must be running; or use --key <hex> / --seed <seed> offline")
             return None
-        seed, key = found
-        print(f"\n[+] HIT! seed={seed}")
+        seed, key, wxid = found
+        print(f"\n[+] HIT! seed={seed} | wxid={wxid}")
         print(f"[+] emoticon key = {key.hex()}")
         print(f"[+] md5 input = {seed}{wxid}EMOTICON")
 
@@ -1303,11 +1619,11 @@ def tool_show_keys(data_dir, wxid, emo_dir):
     if not c0:
         print("[!] No emoticon file to verify against (WeChat must be running)")
         return None
-    found = find_key_from_memory(c0, wxid)
+    found = find_key_from_memory(c0, wxid_candidates(data_dir, wxid))
     if not found:
         print("[!] Memory scan found no seed (WeChat must be running)")
         return None
-    seed, key = found
+    seed, key, wxid = found
     v2key = hashlib.md5(f"{seed}{wxid}".encode()).hexdigest()[:16]
     print(f"\n[+] seed        = {seed} (md5 input: {seed}{wxid}EMOTICON)")
     print(f"[+] emoticon key = {key.hex()} (AES-128-CBC key=IV)")
@@ -1378,7 +1694,7 @@ def interactive():
 
 def main():
     ap = argparse.ArgumentParser(description="WeChat Data Decryption Tool (无参数运行进入交互菜单; 可选参数用于离线/自定义)")
-    ap.add_argument("--data-dir", help="WeChat data dir (xwechat_files/wxid_xxx_b487)")
+    ap.add_argument("--data-dir", help="WeChat data dir (xwechat_files/wxid_xxx_<4hex>, 后缀随安装路径变化)")
     ap.add_argument("--db", help="path to a decrypted emoticon.db")
     ap.add_argument("--key", help="provide key (hex), skip memory scan")
     ap.add_argument("--out", default="emoticon_export", help="output directory")
